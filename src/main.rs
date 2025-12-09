@@ -99,12 +99,12 @@ async fn pump_client_to_upstream<
                             warn!(%peer, "client sent close frame (no payload)");
                         }
                     }
-                    Message::Ping(_) => {
-                        info!(%peer, "client ping");
-                    }
-                    Message::Pong(_) => {
-                        info!(%peer, "client pong");
-                    }
+                    // Message::Ping(_) => {
+                    //     info!(%peer, "client ping");
+                    // }
+                    // Message::Pong(_) => {
+                    //     info!(%peer, "client pong");
+                    // }
                     _ => {}
                 }
 
@@ -172,12 +172,12 @@ async fn pump_upstream_to_client<
                             warn!(%peer, "upstream sent close frame (no payload)");
                         }
                     }
-                    Message::Ping(_) => {
-                        info!(%peer, "upstream ping");
-                    }
-                    Message::Pong(_) => {
-                        info!(%peer, "upstream pong");
-                    }
+                    // `                    Message::Ping(_) => {
+                    //                         info!(%peer, "upstream ping");
+                    //                     }
+                    //                     Message::Pong(_) => {
+                    //                         info!(%peer, "upstream pong");
+                    //                     }`
                     Message::Text(txt) => {
                         if should_drop_upstream_text(txt) {
                             warn!(%peer, "dropped invalid eth_subscription message: {}", txt);
