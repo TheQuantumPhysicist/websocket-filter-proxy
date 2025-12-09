@@ -1,8 +1,10 @@
+
 {
     "cSpell.words": [
         "drpc",
         "rustls",
         "tungstenite",
         "webpki"
-    ]
+    ],
+    "editor.formatOnSave": true,
 }

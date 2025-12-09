@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto provider");
+
     let listener = TcpListener::bind(args.listen).await?;
     info!("listening on {}", args.listen);
 
