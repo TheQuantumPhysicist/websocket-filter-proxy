@@ -81,12 +81,23 @@ async fn pump_client_to_upstream<
     mut c_rx: C,
     mut u_tx: U,
 ) -> anyhow::Result<()> {
+    // Relay everything from client -> upstream, but log close/control/error with detail.
     while let Some(msg) = c_rx.next().await {
         match msg {
             Ok(m) => {
                 match &m {
-                    Message::Close(frame) => {
-                        warn!(%peer, ?frame, "client sent close");
+                    Message::Close(frame_opt) => {
+                        // Client initiated close: log full close info.
+                        if let Some(frame) = frame_opt {
+                            warn!(
+                                %peer,
+                                code = ?frame.code,
+                                reason = %frame.reason,
+                                "client sent close frame"
+                            );
+                        } else {
+                            warn!(%peer, "client sent close frame (no payload)");
+                        }
                     }
                     Message::Ping(_) => {
                         info!(%peer, "client ping");
@@ -96,18 +107,42 @@ async fn pump_client_to_upstream<
                     }
                     _ => {}
                 }
+
                 if let Err(e) = u_tx.send(m).await {
                     error!(%peer, "send to upstream failed: {e}");
                     return Err(e.into());
                 }
             }
             Err(e) => {
-                error!(%peer, "client recv failed: {e}");
+                // Classify tungstenite errors so you see real cause.
+                use tokio_tungstenite::tungstenite::Error as WsErr;
+                match &e {
+                    WsErr::ConnectionClosed => {
+                        warn!(%peer, "client recv: connection closed cleanly");
+                    }
+                    WsErr::AlreadyClosed => {
+                        warn!(%peer, "client recv: already closed");
+                    }
+                    WsErr::Io(ioe) => {
+                        error!(%peer, io_error = %ioe, "client recv: IO error");
+                    }
+                    WsErr::Protocol(pe) => {
+                        error!(%peer, protocol_error = %pe, "client recv: protocol error");
+                    }
+                    WsErr::Utf8(e) => {
+                        error!(%peer, err=%e, "client recv: invalid utf8");
+                    }
+                    other => {
+                        error!(%peer, err = %other, "client recv: websocket error");
+                    }
+                }
                 return Err(e.into());
             }
         }
     }
-    warn!(%peer, "client stream ended (EOF)");
+
+    // Stream ended without an error (EOF) — this is a common “looks like a drop” case.
+    warn!(%peer, "client stream ended (EOF / None from c_rx)");
     Ok(())
 }
 
@@ -119,12 +154,23 @@ async fn pump_upstream_to_client<
     mut u_rx: U,
     mut c_tx: C,
 ) -> anyhow::Result<()> {
+    // Relay upstream -> client, filtering only invalid subscription notifications.
     while let Some(msg) = u_rx.next().await {
         match msg {
             Ok(m) => {
                 match &m {
-                    Message::Close(frame) => {
-                        warn!(%peer, ?frame, "upstream sent close");
+                    Message::Close(frame_opt) => {
+                        // Upstream initiated close: log full close info.
+                        if let Some(frame) = frame_opt {
+                            warn!(
+                                %peer,
+                                code = ?frame.code,
+                                reason = %frame.reason,
+                                "upstream sent close frame"
+                            );
+                        } else {
+                            warn!(%peer, "upstream sent close frame (no payload)");
+                        }
                     }
                     Message::Ping(_) => {
                         info!(%peer, "upstream ping");
@@ -147,12 +193,35 @@ async fn pump_upstream_to_client<
                 }
             }
             Err(e) => {
-                error!(%peer, "upstream recv failed: {e}");
+                // Classify tungstenite errors so you see real cause.
+                use tokio_tungstenite::tungstenite::Error as WsErr;
+                match &e {
+                    WsErr::ConnectionClosed => {
+                        warn!(%peer, "upstream recv: connection closed cleanly");
+                    }
+                    WsErr::AlreadyClosed => {
+                        warn!(%peer, "upstream recv: already closed");
+                    }
+                    WsErr::Io(ioe) => {
+                        error!(%peer, io_error = %ioe, "upstream recv: IO error");
+                    }
+                    WsErr::Protocol(pe) => {
+                        error!(%peer, protocol_error = %pe, "upstream recv: protocol error");
+                    }
+                    WsErr::Utf8(e) => {
+                        error!(%peer, err=%e, "upstream recv: invalid utf8");
+                    }
+                    other => {
+                        error!(%peer, err = %other, "upstream recv: websocket error");
+                    }
+                }
                 return Err(e.into());
             }
         }
     }
-    warn!(%peer, "upstream stream ended (EOF)");
+
+    // Stream ended without an error (EOF).
+    warn!(%peer, "upstream stream ended (EOF / None from u_rx)");
     Ok(())
 }
 
@@ -165,14 +234,16 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // Normalize once.
     let upstream_url = normalize_upstream(&args.upstream)?;
     info!("normalized upstream = {}", upstream_url);
 
+    // Test connect once at startup.
     info!("testing upstream connection...");
     match connect_async(upstream_url.as_str()).await {
         Ok((mut ws, _)) => {
             info!("upstream connection OK");
-            let _ = ws.close(None).await;
+            let _ = ws.close(None).await; // best-effort clean close
         }
         Err(e) => {
             error!("upstream connection test failed: {e}");
@@ -214,19 +285,18 @@ async fn main() -> anyhow::Result<()> {
             let c2u = pump_client_to_upstream(peer, c_rx, u_tx);
             let u2c = pump_upstream_to_client(peer, u_rx, c_tx);
 
+            // Log which direction ended first, and with what.
             tokio::select! {
                 res = c2u => {
-                    if let Err(e) = res {
-                        warn!(%peer, "c2u ended with error: {e}");
-                    } else {
-                        info!(%peer, "c2u ended cleanly");
+                    match res {
+                        Ok(()) => warn!(%peer, "c2u ended cleanly (client->upstream)"),
+                        Err(e) => warn!(%peer, "c2u ended with error: {e}"),
                     }
                 }
                 res = u2c => {
-                    if let Err(e) = res {
-                        warn!(%peer, "u2c ended with error: {e}");
-                    } else {
-                        info!(%peer, "u2c ended cleanly");
+                    match res {
+                        Ok(()) => warn!(%peer, "u2c ended cleanly (upstream->client)"),
+                        Err(e) => warn!(%peer, "u2c ended with error: {e}"),
                     }
                 }
             }
