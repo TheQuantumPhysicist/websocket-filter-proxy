@@ -73,25 +73,106 @@ fn should_drop_upstream_text(txt: &str) -> bool {
     log_like && !map.contains_key("address")
 }
 
+async fn pump_client_to_upstream<
+    C: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    U: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+>(
+    peer: SocketAddr,
+    mut c_rx: C,
+    mut u_tx: U,
+) -> anyhow::Result<()> {
+    while let Some(msg) = c_rx.next().await {
+        match msg {
+            Ok(m) => {
+                match &m {
+                    Message::Close(frame) => {
+                        warn!(%peer, ?frame, "client sent close");
+                    }
+                    Message::Ping(_) => {
+                        info!(%peer, "client ping");
+                    }
+                    Message::Pong(_) => {
+                        info!(%peer, "client pong");
+                    }
+                    _ => {}
+                }
+                if let Err(e) = u_tx.send(m).await {
+                    error!(%peer, "send to upstream failed: {e}");
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                error!(%peer, "client recv failed: {e}");
+                return Err(e.into());
+            }
+        }
+    }
+    warn!(%peer, "client stream ended (EOF)");
+    Ok(())
+}
+
+async fn pump_upstream_to_client<
+    U: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    C: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+>(
+    peer: SocketAddr,
+    mut u_rx: U,
+    mut c_tx: C,
+) -> anyhow::Result<()> {
+    while let Some(msg) = u_rx.next().await {
+        match msg {
+            Ok(m) => {
+                match &m {
+                    Message::Close(frame) => {
+                        warn!(%peer, ?frame, "upstream sent close");
+                    }
+                    Message::Ping(_) => {
+                        info!(%peer, "upstream ping");
+                    }
+                    Message::Pong(_) => {
+                        info!(%peer, "upstream pong");
+                    }
+                    Message::Text(txt) => {
+                        if should_drop_upstream_text(txt) {
+                            warn!(%peer, "dropped invalid eth_subscription message: {}", txt);
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+
+                if let Err(e) = c_tx.send(m).await {
+                    error!(%peer, "send to client failed: {e}");
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                error!(%peer, "upstream recv failed: {e}");
+                return Err(e.into());
+            }
+        }
+    }
+    warn!(%peer, "upstream stream ended (EOF)");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install rustls crypto provider");
 
-    // Normalize once.
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
     let upstream_url = normalize_upstream(&args.upstream)?;
     info!("normalized upstream = {}", upstream_url);
 
-    // Test connect once at startup.
     info!("testing upstream connection...");
     match connect_async(upstream_url.as_str()).await {
         Ok((mut ws, _)) => {
             info!("upstream connection OK");
-            let _ = ws.close(None).await; // best-effort clean close
+            let _ = ws.close(None).await;
         }
         Err(e) => {
             error!("upstream connection test failed: {e}");
@@ -109,12 +190,12 @@ async fn main() -> anyhow::Result<()> {
         let upstream_url = upstream_url.clone();
 
         tokio::spawn(async move {
-            info!("client connected: {}", peer);
+            info!(%peer, "client connected");
 
             let client_ws = match accept_async(stream).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    error!("accept ws failed: {e}");
+                    error!(%peer, "accept ws failed: {e}");
                     return;
                 }
             };
@@ -122,64 +203,35 @@ async fn main() -> anyhow::Result<()> {
             let upstream_ws = match connect_async(upstream_url.as_str()).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
-                    error!("connect upstream failed: {e}");
+                    error!(%peer, "connect upstream failed: {e}");
                     return;
                 }
             };
 
-            let (mut c_tx, mut c_rx) = client_ws.split();
-            let (mut u_tx, mut u_rx) = upstream_ws.split();
+            let (c_tx, c_rx) = client_ws.split();
+            let (u_tx, u_rx) = upstream_ws.split();
 
-            let c2u = async {
-                while let Some(msg) = c_rx.next().await {
-                    match msg {
-                        Ok(m) => {
-                            if let Err(e) = u_tx.send(m).await {
-                                error!("send to upstream failed: {e}");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("client recv failed: {e}");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            let u2c = async {
-                while let Some(msg) = u_rx.next().await {
-                    match msg {
-                        Ok(Message::Text(txt)) => {
-                            if should_drop_upstream_text(&txt) {
-                                warn!("dropped invalid eth_subscription message: {}", txt);
-                                continue;
-                            }
-                            if let Err(e) = c_tx.send(Message::Text(txt)).await {
-                                error!("send to client failed: {e}");
-                                break;
-                            }
-                        }
-                        Ok(other) => {
-                            if let Err(e) = c_tx.send(other).await {
-                                error!("send to client failed: {e}");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("upstream recv failed: {e}");
-                            break;
-                        }
-                    }
-                }
-            };
+            let c2u = pump_client_to_upstream(peer, c_rx, u_tx);
+            let u2c = pump_upstream_to_client(peer, u_rx, c_tx);
 
             tokio::select! {
-                _ = c2u => {},
-                _ = u2c => {},
+                res = c2u => {
+                    if let Err(e) = res {
+                        warn!(%peer, "c2u ended with error: {e}");
+                    } else {
+                        info!(%peer, "c2u ended cleanly");
+                    }
+                }
+                res = u2c => {
+                    if let Err(e) = res {
+                        warn!(%peer, "u2c ended with error: {e}");
+                    } else {
+                        info!(%peer, "u2c ended cleanly");
+                    }
+                }
             }
 
-            info!("client disconnected: {}", peer);
+            info!(%peer, "client disconnected");
         });
     }
 }
