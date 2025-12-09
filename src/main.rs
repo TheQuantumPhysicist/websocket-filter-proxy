@@ -54,11 +54,23 @@ fn should_drop_upstream_text(txt: &str) -> bool {
     }
 
     let result = obj.get("params").and_then(|p| p.get("result"));
+    let Some(Value::Object(map)) = result else {
+        return false; // no/odd result => forward
+    };
 
-    match result {
-        Some(Value::Object(map)) => !map.contains_key("address"),
-        _ => false, // no result / non-object result => forward
+    // 1) Drop truly empty results like {}
+    if map.is_empty() {
+        return true;
     }
+
+    // 2) If it *looks like a log* but lacks required "address", drop.
+    let log_like = map.contains_key("topics")
+        || map.contains_key("data")
+        || map.contains_key("logIndex")
+        || map.contains_key("transactionHash")
+        || map.contains_key("removed");
+
+    log_like && !map.contains_key("address")
 }
 
 #[tokio::main]
