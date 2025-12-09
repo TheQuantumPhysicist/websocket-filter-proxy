@@ -1,7 +1,7 @@
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -20,6 +20,7 @@ struct Args {
 /// Map http(s) → ws(s) and validate scheme.
 fn normalize_upstream(u: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(u)?;
+
     match url.scheme() {
         "ws" | "wss" => {}
         "http" => {
@@ -32,6 +33,7 @@ fn normalize_upstream(u: &str) -> anyhow::Result<Url> {
         }
         s => return Err(anyhow::anyhow!("unsupported upstream scheme: {s}")),
     }
+
     Ok(url)
 }
 
@@ -68,12 +70,31 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("install rustls crypto provider");
 
+    // Normalize once.
+    let upstream_url = normalize_upstream(&args.upstream)?;
+    info!("normalized upstream = {}", upstream_url);
+
+    // Test connect once at startup.
+    info!("testing upstream connection...");
+    match connect_async(upstream_url.as_str()).await {
+        Ok((mut ws, _)) => {
+            info!("upstream connection OK");
+            let _ = ws.close(None).await; // best-effort clean close
+        }
+        Err(e) => {
+            error!("upstream connection test failed: {e}");
+            return Err(e.into());
+        }
+    }
+
     let listener = TcpListener::bind(args.listen).await?;
     info!("listening on {}", args.listen);
 
+    let upstream_url = Arc::new(upstream_url.to_string());
+
     loop {
         let (stream, peer) = listener.accept().await?;
-        let upstream_url = args.upstream.clone();
+        let upstream_url = upstream_url.clone();
 
         tokio::spawn(async move {
             info!("client connected: {}", peer);
@@ -86,15 +107,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let upstream_url = match normalize_upstream(&upstream_url) {
-                Ok(u) => u,
-                Err(e) => {
-                    error!("bad upstream url: {e}");
-                    return;
-                }
-            };
-
-            // NOTE: pass &str, not Url, to connect_async
             let upstream_ws = match connect_async(upstream_url.as_str()).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
